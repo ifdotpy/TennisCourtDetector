@@ -107,4 +107,4 @@ if __name__ == '__main__':
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'val_best_accuracy': val_best_accuracy
-        }, model_last_path)
+        }, args.backup_path)
