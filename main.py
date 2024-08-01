@@ -19,6 +19,7 @@ if __name__ == '__main__':
     parser.add_argument('--val_intervals', type=int, default=5, help='number of epochs to run validation')
     parser.add_argument('--steps_per_epoch', type=int, default=1000, help='number of steps per one epoch')
     parser.add_argument('--resume', type=str, default=None, help='path to the checkpoint to resume from')
+    parser.add_argument('--backup_path', type=str, default=None, help='path to the checkpoint for backup')
     args = parser.parse_args()
 
     train_dataset = courtDataset('train')
@@ -95,6 +96,12 @@ if __name__ == '__main__':
                     'val_best_accuracy': val_best_accuracy
                 }, model_best_path)
             # Save checkpoint
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'val_best_accuracy': val_best_accuracy
+        }, model_last_path)
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
