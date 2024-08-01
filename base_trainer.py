@@ -6,8 +6,9 @@ def train(model, train_loader, optimizer, criterion, device, epoch, max_iters=10
     model.train()
     losses = []
     max_iters = min(max_iters, len(train_loader))
+    progress_bar = tqdm(train_loader, total=max_iters, desc=f"Epoch {epoch}")
 
-    for iter_id, batch in enumerate(tqdm(train_loader, total=max_iters, desc=f"Epoch {epoch}")):
+    for iter_id, batch in enumerate(progress_bar):
         out = model(batch[0].float().to(device))
         gt_hm_hp = batch[1].float().to(device)
         loss = criterion(F.sigmoid(out), gt_hm_hp)
@@ -16,7 +17,7 @@ def train(model, train_loader, optimizer, criterion, device, epoch, max_iters=10
         optimizer.step()
         optimizer.zero_grad()
         if iter_id % 10 == 0:
-            tqdm.write('train, epoch = {}, iter_id = {}/{}, loss = {}'.format(epoch, iter_id, max_iters, loss.item()))
+            progress_bar.set_postfix(loss=loss.item())
         losses.append(loss.item())
         if iter_id > max_iters:
             break
