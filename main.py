@@ -60,7 +60,7 @@ if __name__ == '__main__':
     val_best_accuracy = 0
     if args.resume is not None and os.path.isfile(args.resume):
         print(f"Loading checkpoint '{args.resume}'")
-        checkpoint = torch.load(args.resume)
+        checkpoint = torch.load(args.resume, map_location=device)
         if 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
