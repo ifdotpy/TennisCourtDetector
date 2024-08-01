@@ -6,6 +6,7 @@ from scipy.spatial import distance
 from postprocess import postprocess
 from dataset import courtDataset
 from tracknet import BallTrackerNet
+from tqdm import tqdm
 import argparse
 import torch.nn as nn
 
@@ -14,7 +15,9 @@ def val(model, val_loader, criterion, device, epoch):
     losses = []
     tp, fp, fn, tn = 0, 0, 0, 0
     max_dist = 7
-    for iter_id, batch in enumerate(val_loader):
+    progress_bar = tqdm(val_loader, desc=f"Validation Epoch {epoch}")
+
+    for iter_id, batch in enumerate(progress_bar):
         with torch.no_grad():
             batch_size = batch[0].shape[0]
             out = model(batch[0].float().to(device))
@@ -46,9 +49,18 @@ def val(model, val_loader, criterion, device, epoch):
             eps = 1e-15
             precision = round(tp / (tp + fp + eps), 5)
             accuracy = round((tp + tn) / (tp + tn + fp + fn + eps), 5)
-            print('val, epoch = {}, iter_id = {}/{}, loss = {}, tp = {}, fp = {}, fn = {}, tn = {}, precision = {}, '
-                  'accuracy = {}'.format(epoch, iter_id, len(val_loader), round(loss.item(), 5), tp, fp, fn, tn,
-                                         precision, accuracy))
+            progress_bar.set_postfix(
+                epoch=epoch,
+                iter_id=iter_id,
+                total_iters=len(val_loader),
+                loss=round(loss.item(), 5),
+                tp=tp,
+                fp=fp,
+                fn=fn,
+                tn=tn,
+                precision=precision,
+                accuracy=accuracy
+            )
             losses.append(loss.item())
     return np.mean(losses), tp, fp, fn, tn, precision, accuracy
 
@@ -75,8 +87,3 @@ if __name__ == '__main__':
     criterion = nn.MSELoss()
 
     val_loss, tp, fp, fn, tn, precision, accuracy = val(model, val_loader, criterion, device, -1)
-
-
-
-
-
