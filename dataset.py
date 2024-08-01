@@ -41,9 +41,18 @@ class courtDataset(Dataset):
         img_name = self.data[index]['id'] + '.png'
         kps = self.data[index]['kps']
         img = cv2.imread(os.path.join(self.path_images, img_name))
-        img = cv2.resize(img, (self.output_width, self.output_height))
-        inp = (img.astype(np.float32) / 255.)
-        inp = np.rollaxis(inp, 2, 0)
+
+        img = cv2.resize(img, (self.output_width, self.output_height), interpolation=cv2.INTER_AREA)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        img = cv2.threshold(img, 150, 255, cv2.THRESH_BINARY)[1]
+
+        img = img.reshape((360, 640, 1))
+
+
+        # img = (img.astype(np.float32) / 255.)
+        img = np.rollaxis(img, 2, 0)
+
+        inp = img
 
         hm_hp = np.zeros((self.num_joints+1, self.output_height, self.output_width), dtype=np.float32)
         draw_gaussian = draw_umich_gaussian
