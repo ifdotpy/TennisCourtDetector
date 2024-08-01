@@ -1,3 +1,5 @@
+from collections import OrderedDict
+
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -49,18 +51,18 @@ def val(model, val_loader, criterion, device, epoch):
             eps = 1e-15
             precision = round(tp / (tp + fp + eps), 5)
             accuracy = round((tp + tn) / (tp + tn + fp + fn + eps), 5)
-            progress_bar.set_postfix(
-                epoch=epoch,
-                iter_id=iter_id,
-                total_iters=len(val_loader),
-                loss=round(loss.item(), 5),
-                tp=tp,
-                fp=fp,
-                fn=fn,
-                tn=tn,
-                precision=precision,
-                accuracy=accuracy
-            )
+            progress_bar.set_postfix(OrderedDict([
+                ('epoch', epoch),
+                ('iter_id', iter_id),
+                ('total_iters', len(val_loader)),
+                ('loss', round(loss.item(), 5)),
+                ('tp', tp),
+                ('fp', fp),
+                ('fn', fn),
+                ('tn', tn),
+                ('precision', precision),
+                ('accuracy', accuracy)
+            ]))
             losses.append(loss.item())
     return np.mean(losses), tp, fp, fn, tn, precision, accuracy
 
