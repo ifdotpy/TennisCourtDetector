@@ -7,7 +7,7 @@ from utils import draw_umich_gaussian, line_intersection, is_point_in_image
 
 class courtDataset(Dataset):
     
-    def __init__(self, mode, input_height=720, input_width=1280, scale=2, hp_radius=55):
+    def __init__(self, mode, input_height=720, input_width=1280, scale=2, hp_radius=3):
 
         self.mode = mode
         assert mode in ['train', 'val'], 'incorrect mode'
@@ -44,12 +44,11 @@ class courtDataset(Dataset):
 
         img = cv2.resize(img, (self.output_width, self.output_height), interpolation=cv2.INTER_AREA)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        img = cv2.threshold(img, 150, 255, cv2.THRESH_BINARY)[1]
+        img = cv2.Canny(img, 50, 255, apertureSize=3)
+        # img = cv2.threshold(img, 150, 255, cv2.THRESH_BINARY)[1]
 
         img = img.reshape((360, 640, 1))
 
-
-        # img = (img.astype(np.float32) / 255.)
         img = np.rollaxis(img, 2, 0)
 
         inp = img

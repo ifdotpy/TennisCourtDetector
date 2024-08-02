@@ -2,6 +2,7 @@ import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 
+
 def train(model, train_loader, optimizer, criterion, device, epoch, max_iters=1000):
     model.train()
     losses = []
