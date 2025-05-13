@@ -1,91 +1,85 @@
 from collections import OrderedDict
 
-import torch
 import numpy as np
-import torch.nn.functional as F
-from utils import is_point_in_image
+import torch
 from scipy.spatial import distance
-from postprocess import postprocess
-from dataset import courtDataset
-from tracknet import BallTrackerNet
 from tqdm import tqdm
-import argparse
-import torch.nn as nn
 
-def val(model, val_loader, criterion, device, epoch):
+# from TennisCourtDetector.aug_test import keypoints
+from inference import find_centroid
+from utils import is_point_in_image
+
+
+def val(model, val_loader, criterion, device, epoch, writer, max_dist=7):
     model.eval()
     losses = []
     tp, fp, fn, tn = 0, 0, 0, 0
-    max_dist = 7
     progress_bar = tqdm(val_loader, desc=f"Validation Epoch {epoch}")
 
+    dsts = []
     for iter_id, batch in enumerate(progress_bar):
         with torch.no_grad():
             batch_size = batch[0].shape[0]
-            out = model(batch[0].float().to(device))
-            kps = batch[2]
-            gt_hm = batch[1].float().to(device)
-            loss = criterion(F.sigmoid(out), gt_hm)
 
-            pred = F.sigmoid(out).detach().cpu().numpy()
+            inputs = batch[0].float().to(device)
+            gt_hm = batch[1].float().to(device)
+            # keypoints = batch[2].float().to(device)
+            kps = batch[2]
+
+            out = model(inputs)
+            loss = criterion(torch.sigmoid(out), gt_hm)
+
+            pred = torch.sigmoid(out).detach().cpu().numpy()
+
             for bs in range(batch_size):
                 for kps_num in range(14):
-                    heatmap = (pred[bs][kps_num] * 255).astype(np.uint8)
-                    x_pred, y_pred = postprocess(heatmap)
+                    heatmap = pred[bs][kps_num]
+
+                    _, (x_pred, y_pred) = find_centroid(heatmap, 0.1)
+
                     x_gt = kps[bs][kps_num][0].item()
                     y_gt = kps[bs][kps_num][1].item()
 
                     if is_point_in_image(x_pred, y_pred) and is_point_in_image(x_gt, y_gt):
                         dst = distance.euclidean((x_pred, y_pred), (x_gt, y_gt))
                         if dst < max_dist:
+                            dsts.append(dst)
                             tp += 1
                         else:
                             fp += 1
-                    elif is_point_in_image(x_pred, y_pred) and not is_point_in_image(x_gt, y_gt):
+                    elif is_point_in_image(x_pred, y_pred):
                         fp += 1
-                    elif not is_point_in_image(x_pred, y_pred) and is_point_in_image(x_gt, y_gt):
+                    elif is_point_in_image(x_gt, y_gt):
                         fn += 1
-                    elif not is_point_in_image(x_pred, y_pred) and not is_point_in_image(x_gt, y_gt):
+                    else:
                         tn += 1
 
-            eps = 1e-15
-            precision = round(tp / (tp + fp + eps), 5)
-            accuracy = round((tp + tn) / (tp + tn + fp + fn + eps), 5)
+            precision = tp / (tp + fp + 1e-15)
+            accuracy = (tp + tn) / (tp + tn + fp + fn + 1e-15)
+
             progress_bar.set_postfix(OrderedDict([
-                ('epoch', epoch),
-                ('iter_id', iter_id),
-                ('total_iters', len(val_loader)),
-                ('loss', round(loss.item(), 5)),
+                ('dst', -1 if len(dsts) == 0 else np.quantile(dsts, 0.95)),
+                ('loss', round(loss.item(), 7)),
                 ('tp', tp),
+                ('tn', tn),
                 ('fp', fp),
                 ('fn', fn),
-                ('tn', tn),
-                ('precision', precision),
-                ('accuracy', accuracy)
+                ('pr', round(precision, 5)),
+                ('acc', round(accuracy, 5))
             ]))
             losses.append(loss.item())
-    return np.mean(losses), tp, fp, fn, tn, precision, accuracy
 
+    avg_loss = np.mean(losses)
+    precision = tp / (tp + fp + 1e-15)
+    accuracy = (tp + tn) / (tp + tn + fp + fn + 1e-15)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--batch_size', type=int, default=2, help='batch size')
-    parser.add_argument('--model_path', type=str, help='path to pretrained model')
-    args = parser.parse_args()
+    # Log validation metrics
+    writer.add_scalar('Val/Loss', avg_loss, epoch)
+    writer.add_scalar('Val/Precision', precision, epoch)
+    writer.add_scalar('Val/Accuracy', accuracy, epoch)
+    writer.add_scalar('Val/TP', tp, epoch)
+    writer.add_scalar('Val/FP', fp, epoch)
+    writer.add_scalar('Val/FN', fn, epoch)
+    writer.add_scalar('Val/TN', tn, epoch)
 
-    val_dataset = courtDataset('val')
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=1,
-        pin_memory=True
-    )
-
-    model = BallTrackerNet(out_channels=15)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model.load_state_dict(torch.load(args.model_path, map_location=device))
-    model = model.to(device)
-    criterion = nn.MSELoss()
-
-    val_loss, tp, fp, fn, tn, precision, accuracy = val(model, val_loader, criterion, device, -1)
+    return avg_loss, tp, fp, fn, tn, precision, accuracy
