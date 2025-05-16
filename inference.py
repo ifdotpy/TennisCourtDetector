@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from scipy.ndimage import gaussian_filter # Added gaussian_filter
 import matplotlib.pyplot as plt # Added for heatmap plotting
+import json # Added for JSON output
 from dataset import preprocess_image
 from courtnetv2 import CourtFinderNetHeatmap
 import argparse
@@ -28,6 +29,8 @@ RIGHT_ANKLE_IDX = 16      # Index of right ankle in COCO keypoints
 
 # --- Constant for Court Averaging ---
 NUM_FRAMES_TO_AVERAGE_COURT = 5
+# --- Constant for Tracking Reassignment ---
+MAX_REASSIGN_DIST = 150 # Maximum pixel distance to reassign a lost ID
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Fast, purely-algebraic court-alignment
@@ -531,6 +534,19 @@ def main(args):
     # --- Court Model Setup ---
     court_model = CourtFinderNetHeatmap()
 
+    # --- Initialize structure for JSON output ---
+    output_json_data = {
+        "court_layout": {
+            "points_corrected_pixels": None,
+            "source_comment": ""
+        },
+        "frames": []
+    }
+    # --- State for selecting a single player for JSON output ---
+    # current_target_player_id_for_json = 1 # No longer using specific ID targeting
+    last_known_selected_player_center_px = None
+
+
     # Dynamic device selection
     if torch.backends.mps.is_available():
         device_selected = torch.device("mps")
@@ -555,14 +571,15 @@ def main(args):
 
     # --- Pose Model Setup ---
     print(f"Loading YOLO pose model from: {args.pose_model_path}")
-    pose_model = YOLO(args.pose_model_path)
+    pose_model = YOLO(args.pose_model_path, task="pose")
     # Move YOLO model to the same device if possible (YOLO handles device internally but good practice)
-    pose_model.to(device_selected)
     print("YOLO pose model loaded.")
 
     # --- Initialize Heatmap Variables ---
-    H_homography = None
+    H_homography = None # This will be used for per-frame homography before static one is set
     all_foot_xy = [] # Accumulate foot positions across all frames
+    frame_counter = 0 # Global frame counter for tracking recency
+    tracked_person_data_prev_frame = {} # Stores data for tracked persons from the previous frame
 
     # --- Variables for Static Court Layout ---
     frames_processed_for_court_avg = 0
@@ -580,10 +597,12 @@ def main(args):
         print(f"Court layout will be averaged from the first {NUM_FRAMES_TO_AVERAGE_COURT} frames (processed as a single batch for court model).")
         print(f"Subsequent pose estimation will use batch size: {batch_size_pose_only}")
 
-        output_video = cv2.VideoWriter('output_video.mp4',
-                                     cv2.VideoWriter_fourcc(*'mp4v'),
-                                     cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30, # Use source FPS
-                                     (args.output_width, args.output_height))
+        output_video = None
+        if not args.speed_mode:
+            output_video = cv2.VideoWriter('output_video.mp4',
+                                         cv2.VideoWriter_fourcc(*'mp4v'),
+                                         cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30, # Use source FPS
+                                         (args.output_width, args.output_height))
 
         total_timings = {
             'preprocess_ms': 0, 
@@ -615,9 +634,9 @@ def main(args):
             num_initial_frames_read = len(initial_frames_original)
             initial_batch_overhead_start_time = time.time()
 
-            # 1.1 YOLO Pose Estimation for initial batch
+            # 1.1 YOLO Pose Estimation for initial batch (NOW WITH predict)
             t_start_pose_initial_batch = time.time()
-            pose_results_initial_batch = pose_model.predict(source=initial_frames_resized_for_pose, half=True, verbose=False, stream=False)
+            pose_results_initial_batch = pose_model.predict(source=initial_frames_resized_for_pose, verbose=False, stream=False, device=device_selected)
             time_pose_initial_batch_ms = (time.time() - t_start_pose_initial_batch) * 1000
             total_timings['pose_estimation_ms'] += time_pose_initial_batch_ms
 
@@ -646,9 +665,13 @@ def main(args):
 
             # 1.4 Average court points from this initial batch
             valid_points_for_averaging = []
-            for cp in corrected_points_list_initial:
+            for cp_idx, cp in enumerate(corrected_points_list_initial):
                 if cp is not None and cp.shape == (14,2) and not np.all(np.isnan(cp)):
                     valid_points_for_averaging.append(cp)
+                    # For JSON: if static_court_points fails, use the first valid one for court_layout
+                    if output_json_data["court_layout"]["points_corrected_pixels"] is None:
+                        output_json_data["court_layout"]["points_corrected_pixels"] = cp.tolist()
+                        output_json_data["court_layout"]["source_comment"] = f"Initial estimate from frame {cp_idx} (used due to later averaging potentially failing or not yet run)."
             
             print(f"\n--- Finished processing {num_initial_frames_read} frames for court averaging ---")
             if valid_points_for_averaging:
@@ -657,8 +680,11 @@ def main(args):
                     static_court_points = np.nanmean(stacked_points, axis=0)
                     if np.all(np.isnan(static_court_points)):
                         print("Warning: Averaging court points resulted in all NaNs."); static_court_points = None
+                        # JSON court_layout will retain the first good estimate if any, or remain None
                     else: 
                         print("Static court points successfully averaged.")
+                        output_json_data["court_layout"]["points_corrected_pixels"] = static_court_points.tolist()
+                        output_json_data["court_layout"]["source_comment"] = "Static court points averaged from initial frames."
                         static_homography = calculate_homography(static_court_points)
                         if static_homography is not None: print("Static homography calculated.")
                         else: print("Warning: Failed to calculate static homography from averaged points.")
@@ -668,26 +694,93 @@ def main(args):
 
             # 1.5 Process and write initial frames
             for i in range(num_initial_frames_read):
-                img_with_poses = pose_results_initial_batch[i].plot() if pose_results_initial_batch and i < len(pose_results_initial_batch) else initial_frames_resized_for_pose[i].copy()
+                single_frame_raw_pose_results = pose_results_initial_batch[i] if pose_results_initial_batch and i < len(pose_results_initial_batch) else None
+                
+                processed_persons_this_frame, _ = simplified_process_persons_for_frame(
+                    single_frame_raw_pose_results, 
+                    frame_counter # tracked_person_data_prev_frame no longer used by simplified func
+                )
+
+                img_with_poses = None # Initialize
+                if not args.speed_mode:
+                    img_with_poses = single_frame_raw_pose_results.plot() if single_frame_raw_pose_results else initial_frames_resized_for_pose[i].copy()
+                else: # In speed mode, provide a placeholder if needed by non-viz logic, though draw_results will be skipped
+                    img_with_poses = initial_frames_resized_for_pose[i].copy() # Or a blank image if preferred
                 
                 current_pred_for_drawing = preds_list_initial[i]
                 current_centroids_for_drawing = centroids_list_initial[i]
                 current_corrected_points_for_drawing = corrected_points_list_initial[i]
+                
+                # --- JSON Data Collection for Initial Batch ---
+                frame_json_data = {
+                    "frame_number": frame_counter,
+                    "player": None # Initialize player as None
+                }
                 
                 active_H_for_footprints_initial = static_homography # Prefer static if already computed
                 if active_H_for_footprints_initial is None and current_corrected_points_for_drawing is not None and \
                    current_corrected_points_for_drawing.shape == (14,2) and not np.all(np.isnan(current_corrected_points_for_drawing)):
                     active_H_for_footprints_initial = calculate_homography(current_corrected_points_for_drawing)
                     if i == 0 and active_H_for_footprints_initial is not None : H_homography = active_H_for_footprints_initial # Legacy for heatmap check
-                
-                if active_H_for_footprints_initial is not None and pose_results_initial_batch and i < len(pose_results_initial_batch):
-                    foot_xy_frame = collect_foot_positions([pose_results_initial_batch[i]], active_H_for_footprints_initial, POSE_CONF_THR)
-                    all_foot_xy.extend(foot_xy_frame)
 
-                result_frame = draw_results_on_image_cv2(img_with_poses, current_centroids_for_drawing, current_pred_for_drawing, current_corrected_points_for_drawing, title="Tennis Court Detection")
-                output_video.write(result_frame)
+                # --- Player Selection for JSON ---
+                selected_player_json_entry = None
+                player_to_process_for_heatmap_legacy = [] # List to hold the selected player's kpts for heatmap
+
+                if processed_persons_this_frame:
+                    chosen_person_data = None
+                    
+                    if last_known_selected_player_center_px is not None: # Try to find closest to last known
+                        min_dist = float('inf')
+                        closest_person = None
+                        for p_data in processed_persons_this_frame: # p_data now has 'id' as simple index
+                            center = get_keypoints_center(p_data['keypoints_with_conf'])
+                            if center is not None:
+                                dist = np.linalg.norm(np.array(center) - np.array(last_known_selected_player_center_px))
+                                if dist < min_dist and dist < MAX_REASSIGN_DIST: # Use MAX_REASSIGN_DIST as threshold
+                                    min_dist = dist
+                                    closest_person = p_data
+                        if closest_person:
+                            chosen_person_data = closest_person
+                    
+                    if not chosen_person_data and processed_persons_this_frame: # Fallback: pick first available if none found by proximity or if no last_known
+                        chosen_person_data = processed_persons_this_frame[0]
+
+                    if chosen_person_data:
+                        person_kpts_np = chosen_person_data['keypoints_with_conf']
+                        player_to_process_for_heatmap_legacy.append(person_kpts_np) # For heatmap
+                        
+                        current_player_center = get_keypoints_center(person_kpts_np)
+                        if current_player_center is not None:
+                            last_known_selected_player_center_px = current_player_center
+                        
+                        single_person_foot_xy_world = []
+                        if active_H_for_footprints_initial is not None:
+                            single_person_foot_xy_world = collect_foot_positions([person_kpts_np], active_H_for_footprints_initial, POSE_CONF_THR)
+                        
+                        selected_player_json_entry = {
+                            # "id" field removed
+                            "keypoints_original_pixels": person_kpts_np.tolist() if person_kpts_np is not None else None,
+                            "foot_positions_world_m": single_person_foot_xy_world
+                        }
+                frame_json_data["player"] = selected_player_json_entry
+                # --- End Player Selection for JSON ---
+
+                if active_H_for_footprints_initial is not None and player_to_process_for_heatmap_legacy: # For heatmap legacy
+                    foot_xy_frame = collect_foot_positions(player_to_process_for_heatmap_legacy, active_H_for_footprints_initial, POSE_CONF_THR)
+                    all_foot_xy.extend(foot_xy_frame)
+                
+                if args.output_json_file:
+                    output_json_data["frames"].append(frame_json_data)
+                # --- End JSON Data Collection --
+
+                if not args.speed_mode and output_video:
+                    result_frame = draw_results_on_image_cv2(img_with_poses, current_centroids_for_drawing, current_pred_for_drawing, current_corrected_points_for_drawing, title="Tennis Court Detection")
+                    output_video.write(result_frame)
+                
                 progress_bar.update(1)
                 frames_written_to_video += 1
+                frame_counter += 1
 
         # --- Phase 2: Process remaining frames (pose-only batches) ---
         while True:
@@ -709,9 +802,9 @@ def main(args):
 
             current_pose_batch_overhead_start_time = time.time()
 
-            # 2.1 YOLO Pose Estimation for current batch
+            # 2.1 YOLO Pose Estimation for current batch (NOW WITH predict)
             t_start_pose_curr_batch = time.time()
-            pose_results_current_batch = pose_model.predict(source=batch_resized_imgs_for_pose, half=True, verbose=False, stream=False)
+            pose_results_current_batch = pose_model.predict(source=batch_resized_imgs_for_pose, verbose=False, stream=False, device=device_selected)
             time_pose_curr_batch_ms = (time.time() - t_start_pose_curr_batch) * 1000
             total_timings['pose_estimation_ms'] += time_pose_curr_batch_ms
 
@@ -722,22 +815,93 @@ def main(args):
 
             # 2.2 Process and write frames from current pose-only batch
             for i in range(num_in_current_pose_batch):
-                img_with_poses = pose_results_current_batch[i].plot() if pose_results_current_batch and i < len(pose_results_current_batch) else batch_resized_imgs_for_pose[i].copy()
+                single_frame_raw_pose_results = pose_results_current_batch[i] if pose_results_current_batch and i < len(pose_results_current_batch) else None
+
+                processed_persons_this_frame, _ = simplified_process_persons_for_frame(
+                    single_frame_raw_pose_results, 
+                    frame_counter # tracked_person_data_prev_frame no longer used
+                )
                 
-                # Court model not run, use static points, pred/centroids are None
-                if static_homography is not None and pose_results_current_batch and i < len(pose_results_current_batch):
-                    foot_xy_frame = collect_foot_positions([pose_results_current_batch[i]], static_homography, POSE_CONF_THR)
-                    all_foot_xy.extend(foot_xy_frame)
+                img_with_poses = None # Initialize
+                if not args.speed_mode:
+                    img_with_poses = single_frame_raw_pose_results.plot() if single_frame_raw_pose_results else batch_resized_imgs_for_pose[i].copy()
+                else:
+                    img_with_poses = batch_resized_imgs_for_pose[i].copy() # Placeholder
                 
-                result_frame = draw_results_on_image_cv2(img_with_poses, None, None, static_court_points, title="Tennis Court Detection (Static Court)")
-                output_video.write(result_frame)
+                # --- JSON Data Collection for Pose-Only Batch ---
+                frame_json_data_pose_only = {
+                    "frame_number": frame_counter,
+                    "player": None # Initialize player as None
+                }
+
+                # --- Player Selection for JSON (Pose-Only) ---
+                selected_player_json_entry_pose_only = None
+                player_to_process_for_heatmap_legacy_pose_only = []
+
+                if processed_persons_this_frame:
+                    chosen_person_data_pose = None
+
+                    if last_known_selected_player_center_px is not None: # Try to find closest to last known
+                        min_dist = float('inf')
+                        closest_person = None
+                        for p_data in processed_persons_this_frame:
+                            center = get_keypoints_center(p_data['keypoints_with_conf'])
+                            if center is not None:
+                                dist = np.linalg.norm(np.array(center) - np.array(last_known_selected_player_center_px))
+                                if dist < min_dist and dist < MAX_REASSIGN_DIST:
+                                    min_dist = dist
+                                    closest_person = p_data
+                        if closest_person:
+                            chosen_person_data_pose = closest_person
+                    
+                    if not chosen_person_data_pose and processed_persons_this_frame: # Fallback: pick first
+                        chosen_person_data_pose = processed_persons_this_frame[0]
+                            
+                    if chosen_person_data_pose:
+                        person_kpts_np = chosen_person_data_pose['keypoints_with_conf']
+                        player_to_process_for_heatmap_legacy_pose_only.append(person_kpts_np)
+
+                        current_player_center = get_keypoints_center(person_kpts_np)
+                        if current_player_center is not None:
+                             last_known_selected_player_center_px = current_player_center
+                        
+                        single_person_foot_xy_world = []
+                        if static_homography is not None:
+                            single_person_foot_xy_world = collect_foot_positions([person_kpts_np], static_homography, POSE_CONF_THR)
+                        
+                        selected_player_json_entry_pose_only = {
+                            "keypoints_original_pixels": person_kpts_np.tolist() if person_kpts_np is not None else None,
+                            "foot_positions_world_m": single_person_foot_xy_world
+                        }
+                frame_json_data_pose_only["player"] = selected_player_json_entry_pose_only
+                 # --- End Player Selection for JSON (Pose-Only) ---
+
+                if static_homography is not None and player_to_process_for_heatmap_legacy_pose_only: # For heatmap legacy
+                    foot_xy_frame_pose_only = collect_foot_positions(player_to_process_for_heatmap_legacy_pose_only, static_homography, POSE_CONF_THR)
+                    all_foot_xy.extend(foot_xy_frame_pose_only)
+                
+                if args.output_json_file:
+                    output_json_data["frames"].append(frame_json_data_pose_only)
+                # --- End JSON Data Collection --
+                
+                if not args.speed_mode and output_video:
+                    result_frame = draw_results_on_image_cv2(img_with_poses, None, None, static_court_points, title="Tennis Court Detection (Static Court)")
+                    output_video.write(result_frame)
+                
                 progress_bar.update(1)
                 frames_written_to_video +=1
+                frame_counter += 1
 
         progress_bar.close()
         cap.release()
-        output_video.release()
-        print(f"\nVideo processing complete. Output saved to output_video.mp4 ({frames_written_to_video} frames written)")
+        if output_video:
+            output_video.release()
+        
+        if not args.speed_mode:
+            print(f"\nVideo processing complete. Output saved to output_video.mp4 ({frames_written_to_video} frames written)")
+        else:
+            print(f"\nVideo processing complete (Speed Mode). {frames_written_to_video} frames processed.")
+            
         if frames_written_to_video > 0:
             print("Average timings per frame (note: court model timings are for initial batch only):")
             # Adjust court model timings to be per-frame *for the frames they ran on*
@@ -780,7 +944,10 @@ def main(args):
                 else:
                     heat, _, _ = generate_heatmap_data(roi_foot_xy, COURT_W_S, SAFE_ZONE, HEATMAP_RES)
                     if heat is not None:
-                        plot_save_heatmap(heat, COURT_W_S, SAFE_ZONE, output_filename="heatmap_from_net.png")
+                        if not args.speed_mode:
+                            plot_save_heatmap(heat, COURT_W_S, SAFE_ZONE, output_filename="heatmap_from_net.png")
+                        else:
+                            print("Heatmap data generated (Speed Mode - not saved).")
                     else:
                         print("Heatmap data generation failed.")
         else: # Static homography is available and assumed to have been used for all_foot_xy after avg period
@@ -792,7 +959,10 @@ def main(args):
             else:
                 heat, _, _ = generate_heatmap_data(roi_foot_xy, COURT_W_S, SAFE_ZONE, HEATMAP_RES)
                 if heat is not None:
-                    plot_save_heatmap(heat, COURT_W_S, SAFE_ZONE, output_filename="heatmap_from_net.png")
+                    if not args.speed_mode:
+                        plot_save_heatmap(heat, COURT_W_S, SAFE_ZONE, output_filename="heatmap_from_net.png")
+                    else:
+                        print("Heatmap data generated (Speed Mode - not saved).")
                 else:
                     print("Heatmap data generation failed.")
 
@@ -808,9 +978,17 @@ def main(args):
 
             # 2. Run YOLO Pose Estimation
             t_start_pose = time.time()
-            pose_results = pose_model.predict(source=img.copy(), verbose=False)
+            pose_results = pose_model.predict(source=img.copy(), verbose=False, device=device_selected)
             timings['pose_estimation_ms'] = (time.time() - t_start_pose) * 1000
-            img_with_poses = pose_results[0].plot()
+            
+            img_with_poses = None # Initialize
+            if not args.speed_mode:
+                if pose_results and len(pose_results) > 0:
+                     img_with_poses = pose_results[0].plot()
+                else:
+                     img_with_poses = img.copy() # Fallback if no pose results
+            else:
+                img_with_poses = img.copy() # Placeholder
 
             # 3. Run Court Model Inference
             out, timings['court_model_inference_ms'] = run_court_model_inference(inp, court_model, device_selected)
@@ -820,30 +998,126 @@ def main(args):
 
             # --- Heatmap Calculation (Single Image) ---
             H_single_image = None # Local H for single image
-            if corrected_points is not None and corrected_points.shape == (14, 2):
+            if corrected_points is not None and corrected_points.shape == (14, 2) and not np.all(np.isnan(corrected_points)):
                 print("Calculating homography for single image...")
                 H_single_image = calculate_homography(corrected_points)
-                if H_single_image is not None: print("Homography calculated for single image.")
-                else: print("Homography failed for single image.")
+                if H_single_image is not None:
+                    print("Homography calculated for single image.")
+                    # For JSON: Populate court_layout for single image
+                    if output_json_data["court_layout"]["points_corrected_pixels"] is None: # Should be if not video
+                        output_json_data["court_layout"]["points_corrected_pixels"] = corrected_points.tolist()
+                        output_json_data["court_layout"]["source_comment"] = "Court points from single image detection."
+                else:
+                    print("Homography failed for single image.")
+                    if output_json_data["court_layout"]["points_corrected_pixels"] is None:
+                         output_json_data["court_layout"]["source_comment"] = "Court points detection failed for single image."
+
             else:
                 print("Warning: Cannot calculate homography for single image, court points invalid.")
+                if output_json_data["court_layout"]["points_corrected_pixels"] is None: # Should be if not video
+                    output_json_data["court_layout"]["source_comment"] = "Court points detection invalid for single image."
 
-            current_frame_foot_xy = []
-            if H_single_image is not None and pose_results:
-                current_frame_foot_xy = collect_foot_positions(pose_results, H_single_image, POSE_CONF_THR)
+
+            current_frame_foot_xy = [] # This will be used for heatmap generation
+            
+            # --- JSON Data Collection for Single Image ---
+            single_image_json_data = {
+                "frame_number": 0,
+                "player": None # Initialize player as None
+            }
+            
+            # --- Player Selection for JSON (Single Image) ---
+            selected_player_json_entry_single_img = None
+            player_to_process_for_heatmap_legacy_single_img = []
+
+            if pose_results and len(pose_results) > 0:
+                yolo_result_obj = pose_results[0]
+                
+                # Create a processed_persons_this_frame equivalent for single image
+                persons_in_single_image = []
+                if yolo_result_obj.boxes is not None and yolo_result_obj.keypoints is not None and yolo_result_obj.keypoints.data.numel() > 0:
+                    all_persons_kpts_in_frame = yolo_result_obj.keypoints.data.cpu().numpy()
+                    # box_ids_tensor = yolo_result_obj.boxes.id # No IDs with .predict
+                    for person_idx in range(all_persons_kpts_in_frame.shape[0]):
+                        # p_id = None # No IDs
+                        # if box_ids_tensor is not None and person_idx < len(box_ids_tensor):
+                        # p_id = int(box_ids_tensor[person_idx].item())
+                        persons_in_single_image.append({
+                            'id': person_idx, # Use simple index as a temporary ID for this frame
+                            'keypoints_with_conf': all_persons_kpts_in_frame[person_idx]
+                        })
+                
+                if persons_in_single_image:
+                    chosen_person_data_single = None
+                    # For single image, if there's a last known center (e.g. from a previous run/context not shown here)
+                    # we could use it. Otherwise, just pick the first.
+                    if last_known_selected_player_center_px is not None: # Unlikely for typical single image use unless part of a sequence
+                        min_dist = float('inf')
+                        closest_person = None
+                        for p_data in persons_in_single_image:
+                            center = get_keypoints_center(p_data['keypoints_with_conf'])
+                            if center is not None:
+                                dist = np.linalg.norm(np.array(center) - np.array(last_known_selected_player_center_px))
+                                if dist < min_dist and dist < MAX_REASSIGN_DIST: # Check against threshold
+                                    min_dist = dist
+                                    closest_person = p_data
+                        if closest_person:
+                            chosen_person_data_single = closest_person
+                    
+                    if not chosen_person_data_single and persons_in_single_image: # Fallback: pick first
+                        chosen_person_data_single = persons_in_single_image[0]
+                        # current_target_player_id_for_json = chosen_person_data_single['id'] # No persistent ID
+
+                    if chosen_person_data_single:
+                        person_kpts_np = chosen_person_data_single['keypoints_with_conf']
+                        player_to_process_for_heatmap_legacy_single_img.append(person_kpts_np) # For heatmap
+                        
+                        # For single image, last_known_selected_player_center_px isn't used for re-acquisition in next frame
+                        # but can be noted if needed for other purposes.
+                        # current_player_center = get_keypoints_center(person_kpts_np) 
+                        # if current_player_center is not None:
+                        #    last_known_selected_player_center_px = current_player_center # Not really used after this for single img
+
+                        single_person_foot_xy_world = []
+                        if H_single_image is not None:
+                            single_person_foot_xy_world = collect_foot_positions([person_kpts_np], H_single_image, POSE_CONF_THR)
+                        
+                        selected_player_json_entry_single_img = {
+                            "keypoints_original_pixels": person_kpts_np.tolist() if person_kpts_np is not None else None,
+                            "foot_positions_world_m": single_person_foot_xy_world
+                        }
+            single_image_json_data["player"] = selected_player_json_entry_single_img
+            # --- End Player Selection for JSON (Single Image) ---
+
+
+            if H_single_image is not None and player_to_process_for_heatmap_legacy_single_img: # For heatmap legacy
+                 current_frame_foot_xy = collect_foot_positions(player_to_process_for_heatmap_legacy_single_img, H_single_image, POSE_CONF_THR)
+
+            if args.output_json_file:
+                output_json_data["frames"].append(single_image_json_data)
+            # --- End JSON Data Collection for Single Image ---
+
             # --- End Heatmap Calculation (Single Image) ---
 
             # 5. Draw Court Results (on top of image with poses)
             t_start_drawing = time.time()
-            result_image = draw_results_on_image_cv2(
-                img_with_poses, # Start drawing on the image with poses
-                centroids,
-                pred, # Pass raw heatmaps (pred)
-                corrected_points,
-                title="Tennis Court Detection"
-            )
-            cv2.imwrite('result.png', result_image)
-            print("Image processing complete. Output saved to result.png")
+            if not args.speed_mode:
+                result_image = draw_results_on_image_cv2(
+                    img_with_poses, # Start drawing on the image with poses
+                    centroids,
+                    pred, # Pass raw heatmaps (pred)
+                    corrected_points,
+                    title="Tennis Court Detection"
+                )
+                cv2.imwrite('result.png', result_image)
+                print("Image processing complete. Output saved to result.png")
+            else:
+                print("Image processing complete (Speed Mode - no image saved).")
+                
+            # Record drawing time even in speed mode if it were part of critical path, 
+            # but draw_results_on_image_cv2 is skipped. So this timing is only for the if/else block basically.
+            timings['drawing_and_saving_ms'] = (time.time() - t_start_drawing) * 1000
+
             print("Timings:")
             for key, time_val in timings.items():
                 print(f"  {key}: {time_val:.2f} ms")
@@ -862,9 +1136,27 @@ def main(args):
                 else:
                     heat_single, _, _ = generate_heatmap_data(roi_foot_xy_single, COURT_W_S, SAFE_ZONE, HEATMAP_RES)
                     if heat_single is not None:
-                        plot_save_heatmap(heat_single, COURT_W_S, SAFE_ZONE, output_filename="heatmap_from_net_single_image.png")
+                        if not args.speed_mode:
+                            plot_save_heatmap(heat_single, COURT_W_S, SAFE_ZONE, output_filename="heatmap_from_net_single_image.png")
+                        else:
+                            print("Heatmap data generated for single image (Speed Mode - not saved).")
                     else:
                         print("Heatmap data generation failed for single image.")
+
+    # --- Save JSON Output if path provided ---
+    if args.output_json_file and output_json_data["frames"]: # Check if frames were added
+        # Ensure court_layout has some info even if points are None
+        if output_json_data["court_layout"]["points_corrected_pixels"] is None and not output_json_data["court_layout"]["source_comment"]:
+             output_json_data["court_layout"]["source_comment"] = "Court points could not be determined."
+        try:
+            with open(args.output_json_file, 'w') as f:
+                json.dump(output_json_data, f, indent=4)
+            print(f"Raw data saved to {args.output_json_file}")
+        except Exception as e:
+            print(f"Error saving JSON output: {e}")
+    elif args.output_json_file: # Path provided but no frames
+        print(f"JSON output file specified ({args.output_json_file}), but no frame data was collected to save.")
+
 
     cv2.destroyAllWindows()
 
@@ -891,26 +1183,67 @@ def calculate_homography(court_points):
         print(f"Error calculating homography: {e}")
         return None
 
-def collect_foot_positions(pose_results_batch, homography, conf_threshold):
-    """Extracts, filters, and transforms foot keypoints for a batch of frames.
-    (Same as before - returns world coords relative to baseline origin)
+def get_keypoints_center(kpts_with_conf, conf_threshold=0.1):
+    """Calculates the center of valid keypoints."""
+    # kpts_with_conf is (N_kpts, 3) or (N_kpts, 2)
+    # If (N_kpts, 2), assume all are valid for center calculation
+    if kpts_with_conf.shape[1] == 3:
+        valid_kpts = kpts_with_conf[kpts_with_conf[:, 2] > conf_threshold]
+    else: # shape is (N_kpts, 2)
+        valid_kpts = kpts_with_conf
+    
+    if valid_kpts.shape[0] == 0:
+        return None
+    return np.nanmean(valid_kpts[:, :2], axis=0)
+
+def simplified_process_persons_for_frame(yolo_results_one_frame, current_frame_idx):
+    """Processes persons from a single frame using YOLO .predict() results."""
+    current_persons_for_frame_output = []
+    # yolo_results_one_frame.boxes.id will be None with .predict()
+
+    if yolo_results_one_frame and yolo_results_one_frame.keypoints is not None and yolo_results_one_frame.keypoints.data.numel() > 0:
+        all_persons_kpts_in_frame = yolo_results_one_frame.keypoints.data.cpu().numpy()
+        
+        for i in range(all_persons_kpts_in_frame.shape[0]): # Iterate over detected persons
+            person_kpts_with_conf = all_persons_kpts_in_frame[i]
+            # No persistent track_id. Assign a simple index for this frame if needed for structure.
+            # This 'id' is not a tracker ID and is only for this frame's list.
+            current_persons_for_frame_output.append({
+                'id': i, # Simple index-based ID for this frame
+                'keypoints_with_conf': person_kpts_with_conf
+            })
+            
+    # The second return value (updated_tracked_persons_map) is now None as we are not maintaining it.
+    return current_persons_for_frame_output, None 
+
+def collect_foot_positions(list_of_person_kpts_for_frame, homography, conf_threshold):
+    """Extracts, filters, and transforms foot keypoints for a list of persons in a single frame.
+    list_of_person_kpts_for_frame: List of [np.array (N_keypoints, 3 for x,y,conf)]
+    Returns world coords relative to baseline origin.
     """
-    batch_foot_xy = []
-    if homography is None: return batch_foot_xy
-    for pose_result in pose_results_batch:
-        if pose_result.keypoints is None: continue
-        kpts = pose_result.keypoints.data.cpu().numpy()
-        for person_kpts in kpts:
-            ankles_uv_conf = []
-            if person_kpts[LEFT_ANKLE_IDX][2] >= conf_threshold: ankles_uv_conf.append(person_kpts[LEFT_ANKLE_IDX])
-            if person_kpts[RIGHT_ANKLE_IDX][2] >= conf_threshold: ankles_uv_conf.append(person_kpts[RIGHT_ANKLE_IDX])
-            if not ankles_uv_conf: continue
-            ankles_uv = np.array([[ankle[:2]] for ankle in ankles_uv_conf], dtype=np.float32)
-            try:
-                ankles_xy = cv2.perspectiveTransform(ankles_uv, homography)
-                if ankles_xy is not None: batch_foot_xy.extend(ankles_xy.reshape(-1, 2).tolist())
-            except Exception: continue
-    return batch_foot_xy
+    frame_foot_xy = []
+    if homography is None: return frame_foot_xy
+
+    for person_kpts_with_conf in list_of_person_kpts_for_frame: # person_kpts_with_conf is for one person
+        ankles_uv_conf = []
+        if person_kpts_with_conf[LEFT_ANKLE_IDX][2] >= conf_threshold:
+            ankles_uv_conf.append(person_kpts_with_conf[LEFT_ANKLE_IDX])
+        if person_kpts_with_conf[RIGHT_ANKLE_IDX][2] >= conf_threshold:
+            ankles_uv_conf.append(person_kpts_with_conf[RIGHT_ANKLE_IDX])
+        
+        if not ankles_uv_conf: continue
+        
+        # Extract u,v (pixel coords) for perspectiveTransform
+        ankles_uv = np.array([[ankle_data[:2]] for ankle_data in ankles_uv_conf], dtype=np.float32)
+        
+        try:
+            ankles_xy_transformed = cv2.perspectiveTransform(ankles_uv, homography)
+            if ankles_xy_transformed is not None:
+                frame_foot_xy.extend(ankles_xy_transformed.reshape(-1, 2).tolist())
+        except Exception as e:
+            # print(f"Debug: Perspective transform failed for ankles_uv: {ankles_uv}, Error: {e}")
+            continue # Skip this person or frame if transform fails
+    return frame_foot_xy
 
 def filter_footprints_for_heatmap(all_foot_xy, court_w_singles, safe_zone):
     """Filters foot positions to the ROI (half court + safe zone).
@@ -1008,5 +1341,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_width', type=int, default=640, help='Width for processing/display')
     parser.add_argument('--output_height', type=int, default=360, help='Height for processing/display')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size for pose estimation after initial court averaging')
+    parser.add_argument('--output_json_file', type=str, default=None, help='Optional path to save raw data as a JSON file')
+    parser.add_argument('--speed_mode', action='store_true', help='Enable speed mode: runs inference and JSON output, skips visualizations.')
     args = parser.parse_args()
     main(args)
