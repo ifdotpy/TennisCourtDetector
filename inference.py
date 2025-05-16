@@ -5,6 +5,8 @@ import torch
 from scipy.ndimage import gaussian_filter # Added gaussian_filter
 import matplotlib.pyplot as plt # Added for heatmap plotting
 import json # Added for JSON output
+import threading
+import queue
 from dataset import preprocess_image
 from courtnetv2 import CourtFinderNetHeatmap
 import argparse
@@ -590,6 +592,7 @@ def main(args):
     file_path = args.input_path
     cap, is_vid = is_video(file_path)
     batch_size_pose_only = args.batch_size # For pose estimation after initial court averaging
+    preprocessor_queue_size = args.batch_size * 2 # Example queue size
 
     if is_vid:
         total_frames_in_video = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -609,239 +612,250 @@ def main(args):
             'court_model_inference_ms': 0, # Will be for the single initial batch
             'court_model_postprocess_ms': 0, # Will be for the single initial batch (centroids + correction)
             'pose_estimation_ms': 0, # Accumulated over all batches
-            'batch_processing_overhead_ms': 0 # Accumulated
+            'batch_processing_overhead_ms': 0, # Accumulated
+            'queue_wait_ms': 0 # Time spent waiting for preprocessor queue
         }
         progress_bar = tqdm(total=total_frames_in_video, desc="Processing video", unit="frame")
         frames_written_to_video = 0
+        # frame_counter is now handled by preprocessor and items from queue
+
+        # --- Initialize and start FramePreprocessor ---
+        frame_preprocessor = FramePreprocessor(cap, args, NUM_FRAMES_TO_AVERAGE_COURT, max_queue_size=preprocessor_queue_size)
+        frame_preprocessor.start()
 
         # --- Phase 1: Process initial NUM_FRAMES_TO_AVERAGE_COURT for court detection --- 
-        initial_frames_original = []
-        initial_frames_resized_for_pose = []
-        initial_frames_preprocessed_for_court = []
-        
-        batch_preprocess_time_acc = 0
+        initial_frames_data_from_queue = []
+        batch_preprocess_time_acc_p1 = 0
+        queue_wait_start_p1 = time.time()
         for _ in range(NUM_FRAMES_TO_AVERAGE_COURT):
-            ret, frame = cap.read()
-            if not ret: break
-            initial_frames_original.append(frame)
-            img_resized, inp_preprocessed, ppt = preprocess_frame_data(frame, args.output_width, args.output_height)
-            initial_frames_resized_for_pose.append(img_resized.copy())
-            initial_frames_preprocessed_for_court.append(inp_preprocessed)
-            batch_preprocess_time_acc += ppt
-        total_timings['preprocess_ms'] += batch_preprocess_time_acc
+            processed_item = frame_preprocessor.output_queue.get()
+            if processed_item is None: # End of stream sentinel
+                break
+            initial_frames_data_from_queue.append(processed_item)
+            batch_preprocess_time_acc_p1 += processed_item['preprocess_time_ms']
+        total_timings['queue_wait_ms'] += (time.time() - queue_wait_start_p1) * 1000 - batch_preprocess_time_acc_p1
+        total_timings['preprocess_ms'] += batch_preprocess_time_acc_p1
 
-        if initial_frames_original:
-            num_initial_frames_read = len(initial_frames_original)
+        if initial_frames_data_from_queue:
+            num_initial_frames_read = len(initial_frames_data_from_queue)
+            initial_frames_original = [item['original_frame'] for item in initial_frames_data_from_queue]
+            initial_frames_resized_for_pose = [item['resized_img_for_pose'] for item in initial_frames_data_from_queue]
+            initial_frames_preprocessed_for_court = [item['inp_preprocessed_for_court'] for item in initial_frames_data_from_queue if item['type'] == 'initial']
+
             initial_batch_overhead_start_time = time.time()
 
-            # 1.1 YOLO Pose Estimation for initial batch (NOW WITH predict)
+            # 1.1 YOLO Pose Estimation for initial batch
             t_start_pose_initial_batch = time.time()
             pose_results_initial_batch = pose_model.predict(source=initial_frames_resized_for_pose, verbose=False, stream=False, device=device_selected)
             time_pose_initial_batch_ms = (time.time() - t_start_pose_initial_batch) * 1000
             total_timings['pose_estimation_ms'] += time_pose_initial_batch_ms
 
             # 1.2 Court Model (single batch for all initial frames)
-            inp_court_model_initial_batch_tensor = torch.stack(
-                [torch.tensor(inp).float() for inp in initial_frames_preprocessed_for_court]
-            ).to(device_selected)
-            
-            out_court_initial_batch, time_court_infer_initial_batch_ms = run_court_model_inference_batch(
-                inp_court_model_initial_batch_tensor, court_model, device_selected
-            )
-            total_timings['court_model_inference_ms'] += time_court_infer_initial_batch_ms # This is for the whole initial batch
-
-            # 1.3 Post-process Court Model Output for initial batch
-            t_start_court_post_initial_batch = time.time()
-            preds_list_initial, centroids_list_initial, corrected_points_list_initial, \
-            time_centroid_calc_initial_batch_ms, time_point_correct_initial_batch_ms = \
-                postprocess_court_model_output_batch(out_court_initial_batch)
-            time_court_post_initial_batch_ms = (time.time() - t_start_court_post_initial_batch) * 1000
-            total_timings['court_model_postprocess_ms'] += time_court_post_initial_batch_ms # Combines centroid and correction timing
-            
-            # Calculate overhead for this initial super-batch
-            initial_batch_total_block_duration_ms = (time.time() - initial_batch_overhead_start_time) * 1000
-            sum_of_initial_components_ms = time_pose_initial_batch_ms + time_court_infer_initial_batch_ms + time_court_post_initial_batch_ms
-            total_timings['batch_processing_overhead_ms'] += initial_batch_total_block_duration_ms - sum_of_initial_components_ms
-
-            # 1.4 Average court points from this initial batch
-            valid_points_for_averaging = []
-            for cp_idx, cp in enumerate(corrected_points_list_initial):
-                if cp is not None and cp.shape == (14,2) and not np.all(np.isnan(cp)):
-                    valid_points_for_averaging.append(cp)
-                    # For JSON: if static_court_points fails, use the first valid one for court_layout
-                    if output_json_data["court_layout"]["points_corrected_pixels"] is None:
-                        output_json_data["court_layout"]["points_corrected_pixels"] = cp.tolist()
-                        output_json_data["court_layout"]["source_comment"] = f"Initial estimate from frame {cp_idx} (used due to later averaging potentially failing or not yet run)."
-            
-            print(f"\n--- Finished processing {num_initial_frames_read} frames for court averaging ---")
-            if valid_points_for_averaging:
-                try:
-                    stacked_points = np.stack(valid_points_for_averaging, axis=0)
-                    static_court_points = np.nanmean(stacked_points, axis=0)
-                    if np.all(np.isnan(static_court_points)):
-                        print("Warning: Averaging court points resulted in all NaNs."); static_court_points = None
-                        # JSON court_layout will retain the first good estimate if any, or remain None
-                    else: 
-                        print("Static court points successfully averaged.")
-                        output_json_data["court_layout"]["points_corrected_pixels"] = static_court_points.tolist()
-                        output_json_data["court_layout"]["source_comment"] = "Static court points averaged from initial frames."
-                        static_homography = calculate_homography(static_court_points)
-                        if static_homography is not None: print("Static homography calculated.")
-                        else: print("Warning: Failed to calculate static homography from averaged points.")
-                except Exception as e: print(f"Error averaging/static H: {e}"); static_court_points=None; static_homography=None
-            else: print(f"No valid court points in first {num_initial_frames_read} frames. No static layout.")
-            print("Court model will not run on subsequent frames.")
-
-            # 1.5 Process and write initial frames
-            for i in range(num_initial_frames_read):
-                single_frame_raw_pose_results = pose_results_initial_batch[i] if pose_results_initial_batch and i < len(pose_results_initial_batch) else None
+            if initial_frames_preprocessed_for_court: # Ensure we have the right data
+                inp_court_model_initial_batch_tensor = torch.stack(
+                    [torch.tensor(inp).float() for inp in initial_frames_preprocessed_for_court]
+                ).to(device_selected)
                 
-                processed_persons_this_frame, _ = simplified_process_persons_for_frame(
-                    single_frame_raw_pose_results, 
-                    frame_counter # tracked_person_data_prev_frame no longer used by simplified func
+                out_court_initial_batch, time_court_infer_initial_batch_ms = run_court_model_inference_batch(
+                    inp_court_model_initial_batch_tensor, court_model, device_selected
                 )
+                total_timings['court_model_inference_ms'] += time_court_infer_initial_batch_ms
 
-                img_with_poses = None # Initialize
-                if not args.speed_mode:
-                    img_with_poses = single_frame_raw_pose_results.plot() if single_frame_raw_pose_results else initial_frames_resized_for_pose[i].copy()
-                else: # In speed mode, provide a placeholder if needed by non-viz logic, though draw_results will be skipped
-                    img_with_poses = initial_frames_resized_for_pose[i].copy() # Or a blank image if preferred
-                
-                current_pred_for_drawing = preds_list_initial[i]
-                current_centroids_for_drawing = centroids_list_initial[i]
-                current_corrected_points_for_drawing = corrected_points_list_initial[i]
-                
-                # --- JSON Data Collection for Initial Batch ---
-                frame_json_data = {
-                    "frame_number": frame_counter,
-                    "player": None # Initialize player as None
-                }
-                
-                active_H_for_footprints_initial = static_homography # Prefer static if already computed
-                if active_H_for_footprints_initial is None and current_corrected_points_for_drawing is not None and \
-                   current_corrected_points_for_drawing.shape == (14,2) and not np.all(np.isnan(current_corrected_points_for_drawing)):
-                    active_H_for_footprints_initial = calculate_homography(current_corrected_points_for_drawing)
-                    if i == 0 and active_H_for_footprints_initial is not None : H_homography = active_H_for_footprints_initial # Legacy for heatmap check
+                # 1.3 Post-process Court Model Output for initial batch
+                t_start_court_post_initial_batch = time.time()
+                preds_list_initial, centroids_list_initial, corrected_points_list_initial, \
+                time_centroid_calc_initial_batch_ms, time_point_correct_initial_batch_ms = \
+                    postprocess_court_model_output_batch(out_court_initial_batch)
+                time_court_post_initial_batch_ms = (time.time() - t_start_court_post_initial_batch) * 1000
+                total_timings['court_model_postprocess_ms'] += time_court_post_initial_batch_ms
+            
+                # Calculate overhead for this initial super-batch
+                initial_batch_total_block_duration_ms = (time.time() - initial_batch_overhead_start_time) * 1000
+                sum_of_initial_components_ms = time_pose_initial_batch_ms + time_court_infer_initial_batch_ms + time_court_post_initial_batch_ms
+                total_timings['batch_processing_overhead_ms'] += initial_batch_total_block_duration_ms - sum_of_initial_components_ms
 
-                # --- Player Selection for JSON ---
-                selected_player_json_entry = None
-                player_to_process_for_heatmap_legacy = [] # List to hold the selected player's kpts for heatmap
+                # 1.4 Average court points from this initial batch
+                valid_points_for_averaging = []
+                for cp_idx, cp in enumerate(corrected_points_list_initial):
+                    if cp is not None and cp.shape == (14,2) and not np.all(np.isnan(cp)):
+                        valid_points_for_averaging.append(cp)
+                        if output_json_data["court_layout"]["points_corrected_pixels"] is None:
+                            output_json_data["court_layout"]["points_corrected_pixels"] = cp.tolist()
+                            output_json_data["court_layout"]["source_comment"] = f"Initial estimate from frame {initial_frames_data_from_queue[cp_idx]['frame_idx']} (used due to later averaging potentially failing or not yet run)."
+                
+                print(f"\n--- Finished processing {num_initial_frames_read} frames for court averaging ---")
+                if valid_points_for_averaging:
+                    try:
+                        stacked_points = np.stack(valid_points_for_averaging, axis=0)
+                        static_court_points = np.nanmean(stacked_points, axis=0)
+                        if np.all(np.isnan(static_court_points)):
+                            print("Warning: Averaging court points resulted in all NaNs."); static_court_points = None
+                        else: 
+                            print("Static court points successfully averaged.")
+                            output_json_data["court_layout"]["points_corrected_pixels"] = static_court_points.tolist()
+                            output_json_data["court_layout"]["source_comment"] = "Static court points averaged from initial frames."
+                            static_homography = calculate_homography(static_court_points)
+                            if static_homography is not None: print("Static homography calculated.")
+                            else: print("Warning: Failed to calculate static homography from averaged points.")
+                    except Exception as e: print(f"Error averaging/static H: {e}"); static_court_points=None; static_homography=None
+                else: print(f"No valid court points in first {num_initial_frames_read} frames. No static layout.")
+                print("Court model will not run on subsequent frames.")
 
-                if processed_persons_this_frame:
-                    chosen_person_data = None
+                # 1.5 Process and write initial frames
+                for i in range(num_initial_frames_read):
+                    current_frame_data = initial_frames_data_from_queue[i]
+                    current_frame_idx_for_json = current_frame_data['frame_idx']
+
+                    single_frame_raw_pose_results = pose_results_initial_batch[i] if pose_results_initial_batch and i < len(pose_results_initial_batch) else None
                     
-                    if last_known_selected_player_center_px is not None: # Try to find closest to last known
-                        min_dist = float('inf')
-                        closest_person = None
-                        for p_data in processed_persons_this_frame: # p_data now has 'id' as simple index
-                            center = get_keypoints_center(p_data['keypoints_with_conf'])
-                            if center is not None:
-                                dist = np.linalg.norm(np.array(center) - np.array(last_known_selected_player_center_px))
-                                if dist < min_dist and dist < MAX_REASSIGN_DIST: # Use MAX_REASSIGN_DIST as threshold
-                                    min_dist = dist
-                                    closest_person = p_data
-                        if closest_person:
-                            chosen_person_data = closest_person
+                    processed_persons_this_frame, _ = simplified_process_persons_for_frame(
+                        single_frame_raw_pose_results, 
+                        current_frame_idx_for_json 
+                    )
+
+                    img_with_poses = None 
+                    if not args.speed_mode:
+                        img_with_poses = single_frame_raw_pose_results.plot() if single_frame_raw_pose_results else current_frame_data['resized_img_for_pose'].copy()
+                    else: 
+                        img_with_poses = current_frame_data['resized_img_for_pose'].copy() 
                     
-                    if not chosen_person_data and processed_persons_this_frame: # Fallback: pick first available if none found by proximity or if no last_known
-                        chosen_person_data = processed_persons_this_frame[0]
+                    current_pred_for_drawing = preds_list_initial[i]
+                    current_centroids_for_drawing = centroids_list_initial[i]
+                    current_corrected_points_for_drawing = corrected_points_list_initial[i]
+                    
+                    frame_json_data = {
+                        "frame_number": current_frame_idx_for_json,
+                        "player": None 
+                    }
+                    
+                    active_H_for_footprints_initial = static_homography 
+                    if active_H_for_footprints_initial is None and current_corrected_points_for_drawing is not None and \
+                       current_corrected_points_for_drawing.shape == (14,2) and not np.all(np.isnan(current_corrected_points_for_drawing)):
+                        active_H_for_footprints_initial = calculate_homography(current_corrected_points_for_drawing)
+                        if i == 0 and active_H_for_footprints_initial is not None : H_homography = active_H_for_footprints_initial 
 
-                    if chosen_person_data:
-                        person_kpts_np = chosen_person_data['keypoints_with_conf']
-                        player_to_process_for_heatmap_legacy.append(person_kpts_np) # For heatmap
+                    selected_player_json_entry = None
+                    player_to_process_for_heatmap_legacy = [] 
+
+                    if processed_persons_this_frame:
+                        chosen_person_data = None
+                        if last_known_selected_player_center_px is not None: 
+                            min_dist = float('inf')
+                            closest_person = None
+                            for p_data in processed_persons_this_frame: 
+                                center = get_keypoints_center(p_data['keypoints_with_conf'])
+                                if center is not None:
+                                    dist = np.linalg.norm(np.array(center) - np.array(last_known_selected_player_center_px))
+                                    if dist < min_dist and dist < MAX_REASSIGN_DIST: 
+                                        min_dist = dist
+                                        closest_person = p_data
+                            if closest_person:
+                                chosen_person_data = closest_person
                         
-                        current_player_center = get_keypoints_center(person_kpts_np)
-                        if current_player_center is not None:
-                            last_known_selected_player_center_px = current_player_center
-                        
-                        single_person_foot_xy_world = []
-                        if active_H_for_footprints_initial is not None:
-                            single_person_foot_xy_world = collect_foot_positions([person_kpts_np], active_H_for_footprints_initial, POSE_CONF_THR)
-                        
-                        selected_player_json_entry = {
-                            # "id" field removed
-                            "keypoints_original_pixels": person_kpts_np.tolist() if person_kpts_np is not None else None,
-                            "foot_positions_world_m": single_person_foot_xy_world
-                        }
-                frame_json_data["player"] = selected_player_json_entry
-                # --- End Player Selection for JSON ---
+                        if not chosen_person_data and processed_persons_this_frame: 
+                            chosen_person_data = processed_persons_this_frame[0]
 
-                if active_H_for_footprints_initial is not None and player_to_process_for_heatmap_legacy: # For heatmap legacy
-                    foot_xy_frame = collect_foot_positions(player_to_process_for_heatmap_legacy, active_H_for_footprints_initial, POSE_CONF_THR)
-                    all_foot_xy.extend(foot_xy_frame)
-                
-                if args.output_json_file:
-                    output_json_data["frames"].append(frame_json_data)
-                # --- End JSON Data Collection --
+                        if chosen_person_data:
+                            person_kpts_np = chosen_person_data['keypoints_with_conf']
+                            player_to_process_for_heatmap_legacy.append(person_kpts_np) 
+                            
+                            current_player_center = get_keypoints_center(person_kpts_np)
+                            if current_player_center is not None:
+                                last_known_selected_player_center_px = current_player_center
+                            
+                            single_person_foot_xy_world = []
+                            if active_H_for_footprints_initial is not None:
+                                single_person_foot_xy_world = collect_foot_positions([person_kpts_np], active_H_for_footprints_initial, POSE_CONF_THR)
+                            
+                            selected_player_json_entry = {
+                                "keypoints_original_pixels": person_kpts_np.tolist() if person_kpts_np is not None else None,
+                                "foot_positions_world_m": single_person_foot_xy_world
+                            }
+                    frame_json_data["player"] = selected_player_json_entry
 
-                if not args.speed_mode and output_video:
-                    result_frame = draw_results_on_image_cv2(img_with_poses, current_centroids_for_drawing, current_pred_for_drawing, current_corrected_points_for_drawing, title="Tennis Court Detection")
-                    output_video.write(result_frame)
-                
-                progress_bar.update(1)
-                frames_written_to_video += 1
-                frame_counter += 1
+                    if active_H_for_footprints_initial is not None and player_to_process_for_heatmap_legacy: 
+                        foot_xy_frame = collect_foot_positions(player_to_process_for_heatmap_legacy, active_H_for_footprints_initial, POSE_CONF_THR)
+                        all_foot_xy.extend(foot_xy_frame)
+                    
+                    if args.output_json_file:
+                        output_json_data["frames"].append(frame_json_data)
 
-        # --- Phase 2: Process remaining frames (pose-only batches) ---
+                    if not args.speed_mode and output_video:
+                        result_frame = draw_results_on_image_cv2(img_with_poses, current_centroids_for_drawing, current_pred_for_drawing, current_corrected_points_for_drawing, title="Tennis Court Detection")
+                        output_video.write(result_frame)
+                    
+                    progress_bar.update(1)
+                    frames_written_to_video += 1
+                    # frame_counter is now implicitly handled by progress from queue
+            else:
+                 print("No initial frames processed from preprocessor queue. Exiting video processing.")
+
+
+        # --- Phase 2: Process remaining frames (pose-only batches) --- 
         while True:
             batch_original_frames = []
             batch_resized_imgs_for_pose = []
+            batch_frame_indices = [] # To keep track of frame numbers for JSON
             current_batch_preprocess_time_acc = 0
-
-            for _ in range(batch_size_pose_only):
-                ret, frame = cap.read()
-                if not ret: break
-                batch_original_frames.append(frame)
-                img_resized, _, ppt = preprocess_frame_data(frame, args.output_width, args.output_height) # inp not needed here
-                batch_resized_imgs_for_pose.append(img_resized.copy())
-                current_batch_preprocess_time_acc += ppt
+            batch_complete = False
             
-            if not batch_original_frames: break # End of video
+            queue_wait_start_p2 = time.time()
+            for _ in range(batch_size_pose_only):
+                processed_item = frame_preprocessor.output_queue.get()
+                if processed_item is None: # End of stream sentinel
+                    batch_complete = True # Mark batch as potentially incomplete but loop should break
+                    break 
+                # Ensure item is for pose_only phase, though preprocessor should handle this switch
+                # We assume items after NUM_FRAMES_TO_AVERAGE_COURT are 'pose_only'
+                batch_original_frames.append(processed_item['original_frame'])
+                batch_resized_imgs_for_pose.append(processed_item['resized_img_for_pose'])
+                batch_frame_indices.append(processed_item['frame_idx'])
+                current_batch_preprocess_time_acc += processed_item['preprocess_time_ms']
+            total_timings['queue_wait_ms'] += (time.time() - queue_wait_start_p2) * 1000 - current_batch_preprocess_time_acc
             total_timings['preprocess_ms'] += current_batch_preprocess_time_acc
-            num_in_current_pose_batch = len(batch_original_frames)
+            
+            if not batch_resized_imgs_for_pose: # No items fetched, likely due to sentinel right away
+                break 
 
+            num_in_current_pose_batch = len(batch_resized_imgs_for_pose)
             current_pose_batch_overhead_start_time = time.time()
 
-            # 2.1 YOLO Pose Estimation for current batch (NOW WITH predict)
+            # 2.1 YOLO Pose Estimation for current batch
             t_start_pose_curr_batch = time.time()
             pose_results_current_batch = pose_model.predict(source=batch_resized_imgs_for_pose, verbose=False, stream=False, device=device_selected)
             time_pose_curr_batch_ms = (time.time() - t_start_pose_curr_batch) * 1000
             total_timings['pose_estimation_ms'] += time_pose_curr_batch_ms
 
-            # Calculate overhead for this pose-only batch
-            # For pose-only batches, components are just pose estimation time
             current_pose_batch_total_block_duration_ms = (time.time() - current_pose_batch_overhead_start_time) * 1000
             total_timings['batch_processing_overhead_ms'] += current_pose_batch_total_block_duration_ms - time_pose_curr_batch_ms
 
             # 2.2 Process and write frames from current pose-only batch
             for i in range(num_in_current_pose_batch):
+                current_frame_idx_for_json = batch_frame_indices[i]
                 single_frame_raw_pose_results = pose_results_current_batch[i] if pose_results_current_batch and i < len(pose_results_current_batch) else None
 
                 processed_persons_this_frame, _ = simplified_process_persons_for_frame(
                     single_frame_raw_pose_results, 
-                    frame_counter # tracked_person_data_prev_frame no longer used
+                    current_frame_idx_for_json 
                 )
                 
-                img_with_poses = None # Initialize
+                img_with_poses = None 
                 if not args.speed_mode:
                     img_with_poses = single_frame_raw_pose_results.plot() if single_frame_raw_pose_results else batch_resized_imgs_for_pose[i].copy()
                 else:
-                    img_with_poses = batch_resized_imgs_for_pose[i].copy() # Placeholder
+                    img_with_poses = batch_resized_imgs_for_pose[i].copy() 
                 
-                # --- JSON Data Collection for Pose-Only Batch ---
                 frame_json_data_pose_only = {
-                    "frame_number": frame_counter,
-                    "player": None # Initialize player as None
+                    "frame_number": current_frame_idx_for_json,
+                    "player": None 
                 }
 
-                # --- Player Selection for JSON (Pose-Only) ---
                 selected_player_json_entry_pose_only = None
                 player_to_process_for_heatmap_legacy_pose_only = []
 
                 if processed_persons_this_frame:
                     chosen_person_data_pose = None
-
-                    if last_known_selected_player_center_px is not None: # Try to find closest to last known
+                    if last_known_selected_player_center_px is not None: 
                         min_dist = float('inf')
                         closest_person = None
                         for p_data in processed_persons_this_frame:
@@ -854,7 +868,7 @@ def main(args):
                         if closest_person:
                             chosen_person_data_pose = closest_person
                     
-                    if not chosen_person_data_pose and processed_persons_this_frame: # Fallback: pick first
+                    if not chosen_person_data_pose and processed_persons_this_frame: 
                         chosen_person_data_pose = processed_persons_this_frame[0]
                             
                     if chosen_person_data_pose:
@@ -874,15 +888,13 @@ def main(args):
                             "foot_positions_world_m": single_person_foot_xy_world
                         }
                 frame_json_data_pose_only["player"] = selected_player_json_entry_pose_only
-                 # --- End Player Selection for JSON (Pose-Only) ---
 
-                if static_homography is not None and player_to_process_for_heatmap_legacy_pose_only: # For heatmap legacy
+                if static_homography is not None and player_to_process_for_heatmap_legacy_pose_only: 
                     foot_xy_frame_pose_only = collect_foot_positions(player_to_process_for_heatmap_legacy_pose_only, static_homography, POSE_CONF_THR)
                     all_foot_xy.extend(foot_xy_frame_pose_only)
                 
                 if args.output_json_file:
                     output_json_data["frames"].append(frame_json_data_pose_only)
-                # --- End JSON Data Collection --
                 
                 if not args.speed_mode and output_video:
                     result_frame = draw_results_on_image_cv2(img_with_poses, None, None, static_court_points, title="Tennis Court Detection (Static Court)")
@@ -890,10 +902,15 @@ def main(args):
                 
                 progress_bar.update(1)
                 frames_written_to_video +=1
-                frame_counter += 1
+            
+            if batch_complete: # Sentinel was received during batch accumulation
+                 break
 
         progress_bar.close()
-        cap.release()
+        # cap.release() # cap is managed by FramePreprocessor
+        frame_preprocessor.stop() # Signal preprocessor to stop
+        frame_preprocessor.join() # Wait for preprocessor to finish
+
         if output_video:
             output_video.release()
         
@@ -1332,6 +1349,62 @@ def plot_save_heatmap(heat, court_w_singles, safe_zone, output_filename="heatmap
     plt.savefig(output_filename)
     print(f"Heatmap saved to {output_filename}")
     plt.close()
+
+class FramePreprocessor(threading.Thread):
+    def __init__(self, cap, args, num_initial_frames, max_queue_size=32, device='cpu'): # device for preprocess if needed
+        super().__init__()
+        self.cap = cap
+        self.args = args
+        self.num_initial_frames = num_initial_frames
+        self.output_queue = queue.Queue(maxsize=max_queue_size)
+        self.daemon = True  # Allow main program to exit even if this thread is running
+        self.running = True
+        self.frames_processed_count = 0
+        # self.device = device # If preprocess_frame_data could use a device
+
+    def run(self):
+        while self.running and self.cap.isOpened():
+            ret, frame = self.cap.read()
+            if not ret:
+                self.running = False
+                break
+
+            img_resized, inp_preprocessed, ppt = preprocess_frame_data(frame, self.args.output_width, self.args.output_height)
+            
+            data_item = {
+                'original_frame': frame,
+                'resized_img_for_pose': img_resized.copy(),
+                'preprocess_time_ms': ppt,
+                'frame_idx': self.frames_processed_count
+            }
+
+            if self.frames_processed_count < self.num_initial_frames:
+                data_item['type'] = 'initial'
+                data_item['inp_preprocessed_for_court'] = inp_preprocessed
+            else:
+                data_item['type'] = 'pose_only'
+                # inp_preprocessed is not strictly needed by main thread for pose-only,
+                # but preprocess_frame_data might return it anyway.
+                # If it's large and truly unused, we could avoid storing it here.
+
+            try:
+                self.output_queue.put(data_item, timeout=1) # Timeout to prevent indefinite block if main thread dies
+                self.frames_processed_count += 1
+            except queue.Full:
+                # Queue is full, main thread is lagging. Sleep briefly or log.
+                # print("Preprocessor queue full, waiting...")
+                time.sleep(0.01)
+                continue # Retry putting the same item
+            except Exception as e:
+                print(f"Preprocessor error: {e}")
+                self.running = False
+                break
+        
+        self.output_queue.put(None) # Sentinel to indicate end of stream
+        print("FramePreprocessor finished.")
+
+    def stop(self):
+        self.running = False
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
